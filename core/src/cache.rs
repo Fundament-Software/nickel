@@ -222,11 +222,14 @@ impl TermCache {
     }
 }
 
-/// This addresses [#2362](https://github.com/tweag/nickel/issues/2362). File paths prefixed with
-/// this are treated specially: they refer to an in-memory source, and may be inserted directly
-/// into the virtual file system with [`ProgramBuilder::add_virtual_file`].
+/// Virtual file prefix: an in-memory source identified by an opaque name that is never resolved
+/// or checked against the filesystem, so it may contain arbitrary characters.
+///
+/// An import written as `import "nickelfs://<name>"` resolves against the virtual files
+/// registered in the source cache (see [SourcePath::VirtualFile]).
 pub const VIRTUAL_PATH_PREFIX: &str = "nickelfs://";
 
+/// Returns `true` if `path` is prefixed by [VIRTUAL_PATH_PREFIX].
 pub fn is_virtual_path(path: impl AsRef<OsStr>) -> bool {
     path.as_ref()
         .as_encoded_bytes()
@@ -330,30 +333,18 @@ impl SourceCache {
     /// Try to retrieve the id of a file from the cache.
     ///
     /// If it was not in cache, try to read it and add it as a new entry.
-    ///
-    /// # In memory sources
-    ///
-    /// Any path prefixed with [`VIRTUAL_PATH_PREFIX`] is treated as an opaque identifier
-    /// that is looked up without normalization. This way, all virtual file paths are segregated
-    /// from the real filesystem, preventing any conflicts.
     pub fn get_or_add_file(
         &mut self,
         path: impl Into<OsString>,
         format: InputFormat,
     ) -> io::Result<CacheOp<FileId>> {
         let path = path.into();
+        let normalized = normalize_path(&path)?;
 
-        // Treat virtual paths as opaque identifiers, skipping normalization
-        let key_path = if is_virtual_path(&path) {
-            PathBuf::from(path)
-        } else {
-            normalize_path(&path)?
-        };
-
-        match self.id_or_new_timestamp_of(key_path.as_ref(), format)? {
+        match self.id_or_new_timestamp_of(normalized.as_ref(), format)? {
             SourceState::UpToDate(id) => Ok(CacheOp::Cached(id)),
             SourceState::Stale(timestamp) => self
-                .add_normalized_file(key_path, format, timestamp)
+                .add_normalized_file(normalized, format, timestamp)
                 .map(CacheOp::Done),
         }
     }
@@ -406,6 +397,23 @@ impl SourceCache {
         id
     }
 
+    /// Registers `content` as a virtual file under the opaque identifier `name`.
+    pub fn add_virtual_file(
+        &mut self,
+        name: impl Into<OsString>,
+        format: InputFormat,
+        content: String,
+    ) -> FileId {
+        self.add_string(SourcePath::VirtualFile(name.into(), format), content)
+    }
+
+    /// Retrieves the id of a virtual file by its exact name.
+    pub fn get_virtual_file(&self, name: &OsStr, format: InputFormat) -> Option<FileId> {
+        self.file_ids
+            .get(&SourcePath::VirtualFile(name.to_owned(), format))
+            .map(|entry| entry.id)
+    }
+
     /// Loads a new source as a string, replacing any existing source with the same name.
     ///
     /// As opposed to [CacheHub::replace_string], this method doesn't update the other caches. It
@@ -437,11 +445,6 @@ impl SourceCache {
         path: PathBuf,
         format: InputFormat,
     ) -> Result<FileCloseResult, FileCloseError> {
-        // A virtual file can't be closed because there is nothing on disk to load from
-        if is_virtual_path(&path) {
-            return Err(FileCloseError::FileNotOpen);
-        }
-
         let entry = self
             .file_ids
             .get_mut(&SourcePath::Path(path.clone(), format))
@@ -483,20 +486,6 @@ impl SourceCache {
     /// The main point of this awkward signature is to minimize I/O operations: if we accessed
     /// the timestamp, keep it around.
     fn id_or_new_timestamp_of(&self, name: &Path, format: InputFormat) -> io::Result<SourceState> {
-        // Virtual paths either exist or don't exist, they are never stale.
-        if is_virtual_path(name) {
-            return self
-                .file_ids
-                .get(&SourcePath::Path(name.to_owned(), format))
-                .map(|entry| SourceState::UpToDate(entry.id))
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("no virtual file registered at {}", name.display()),
-                    )
-                });
-        }
-
         match self
             .file_ids
             .get(&SourcePath::Path(name.to_owned(), format))
@@ -621,7 +610,9 @@ impl SourceCache {
         self.file_paths
             .get(&file_id)
             .and_then(|source| match source {
-                SourcePath::Path(_, input_format) => Some(*input_format),
+                SourcePath::Path(_, input_format) | SourcePath::VirtualFile(_, input_format) => {
+                    Some(*input_format)
+                }
                 SourcePath::Std(_) => Some(InputFormat::Nickel),
                 SourcePath::Snippet(_)
                 | SourcePath::Query
@@ -1858,9 +1849,12 @@ pub enum SourcePath {
     /// Note that this does not need to be a real file on the filesystem: it could still be loaded
     /// from memory by, e.g, [`SourceCache::add_string`].
     ///
-    /// This is the only `SourcePath` variant that can be resolved as the target of an import
-    /// statement.
+    /// Together with [Self::VirtualFile], this is one of the two variants that can be resolved as
+    /// the target of an import statement.
     Path(PathBuf, InputFormat),
+    /// An in-memory source identified by an opaque name rather than a filesystem path. All names
+    /// must begin with "nickelfs://", and can be imported via `import "nickelfs://<identifier>"`
+    VirtualFile(OsString, InputFormat),
     /// A subrange of a file at the given path.
     ///
     /// This is used by NLS to analyze small parts of files that don't fully parse. The original
@@ -1882,6 +1876,9 @@ impl<'a> TryFrom<&'a SourcePath> for &'a OsStr {
     fn try_from(value: &'a SourcePath) -> Result<Self, Self::Error> {
         match value {
             SourcePath::Path(p, _) | SourcePath::Snippet(p) => Ok(p.as_os_str()),
+            // Deliberately not `VirtualFile`: this impl is how an importer's containing directory
+            // is derived, and a virtual file has no directory. Returning its name here would make
+            // relative imports from a virtual file join against the name itself.
             _ => Err(()),
         }
     }
@@ -1889,10 +1886,9 @@ impl<'a> TryFrom<&'a SourcePath> for &'a OsStr {
 
 impl From<&SourcePath> for Option<InputFormat> {
     fn from(source_path: &SourcePath) -> Option<InputFormat> {
-        if let SourcePath::Path(_p, fmt) = source_path {
-            Some(*fmt)
-        } else {
-            None
+        match source_path {
+            SourcePath::Path(_, fmt) | SourcePath::VirtualFile(_, fmt) => Some(*fmt),
+            _ => None,
         }
     }
 }
@@ -1903,6 +1899,7 @@ impl From<SourcePath> for OsString {
     fn from(source_path: SourcePath) -> Self {
         match source_path {
             SourcePath::Path(p, _) | SourcePath::Snippet(p) => p.into(),
+            SourcePath::VirtualFile(name, _) => name,
             SourcePath::Std(StdlibModule::Std) => "<stdlib/std.ncl>".into(),
             SourcePath::Std(StdlibModule::Internals) => "<stdlib/internals.ncl>".into(),
             SourcePath::Query => "<query>".into(),
@@ -2004,30 +2001,63 @@ impl ImportResolver for CacheHub {
     ) -> Result<(ResolvedTerm, FileId), ImportError> {
         let pos = pos_table.get(pos_idx);
 
+        // A virtual import is resolved by exact name: no containing directory, no import paths,
+        // and no filesystem access, so no `Path`/`PathBuf` is constructed for it at all.
+        if let term::Import::Path { path, format } = import
+            && is_virtual_path(path)
+        {
+            let file_id = self
+                .sources
+                .get_virtual_file(path, *format)
+                .ok_or_else(|| {
+                    ImportErrorKind::IOError(
+                        path.to_string_lossy().into_owned(),
+                        "no virtual file is registered under this name".to_owned(),
+                        pos,
+                    )
+                })?;
+
+            if let Some(parent) = parent {
+                self.import_data
+                    .imports
+                    .entry(parent)
+                    .or_default()
+                    .insert(ImportTarget {
+                        file_id,
+                        format: *format,
+                    });
+                self.import_data
+                    .rev_imports
+                    .entry(file_id)
+                    .or_default()
+                    .entry(parent)
+                    .or_insert(pos);
+            }
+
+            self.parse_to_term(pos_table, file_id, *format)
+                .map_err(|err| ImportErrorKind::ParseErrors(err, pos))?;
+
+            return Ok((ResolvedTerm::FromCache, file_id));
+        }
+
         let (possible_parents, path, pkg_id, format) = match import {
             term::Import::Path { path, format } => {
-                // A virtual path is treated as an opaque identifier
-                if is_virtual_path(&path)
-                {
-                    (vec![PathBuf::new()], Path::new(path), None, *format)
-                } else {
-                    // `parent` is the file that did the import. We first look in its containing directory, followed by
-                    // the directories in the import path.
-                    let mut parent_path = parent
-                        .and_then(|p| self.get_path(p))
-                        .map(PathBuf::from)
-                        .unwrap_or_default();
-                    parent_path.pop();
+                // `parent` is the file that did the import. We first look in its containing directory, followed by
+                // the directories in the import path.
+                let mut parent_path = parent
+                    .and_then(|p| self.get_path(p))
+                    .map(PathBuf::from)
+                    .unwrap_or_default();
+                parent_path.pop();
 
-                    (
-                        std::iter::once(parent_path)
-                            .chain(self.sources.import_paths.iter().cloned())
-                            .collect(),
-                        Path::new(path),
-                        None,
-                        *format,
-                    )
-                }
+                (
+                    std::iter::once(parent_path)
+                        .chain(self.sources.import_paths.iter().cloned())
+                        .collect(),
+                    Path::new(path),
+                    None,
+                    *format,
+                )
             }
             term::Import::Package { id } => {
                 let package_map = self
@@ -2293,36 +2323,77 @@ impl AstImportResolver for AstResolver<'_, '_> {
     ) -> Result<Option<&Ast<'_>>, ImportErrorKind> {
         let parent_id = pos.src_id();
 
+        // A virtual import is resolved by its exact name.
+        if let ast::Import::Path { path, format } = import
+            && is_virtual_path(path)
+        {
+            let file_id = self
+                .sources
+                .get_virtual_file(path, *format)
+                .ok_or_else(|| {
+                    ImportErrorKind::IOError(
+                        path.to_string_lossy().into_owned(),
+                        "no virtual file is registered under this name".to_owned(),
+                        *pos,
+                    )
+                })?;
+
+            if let Some(parent_id) = parent_id {
+                self.import_data
+                    .imports
+                    .entry(parent_id)
+                    .or_default()
+                    .insert(ImportTarget {
+                        file_id,
+                        format: *format,
+                    });
+                self.import_data
+                    .rev_imports
+                    .entry(file_id)
+                    .or_default()
+                    .entry(parent_id)
+                    .or_insert(*pos);
+            }
+
+            return if let InputFormat::Nickel = format {
+                if let Some(entry) = self.asts.get(&file_id) {
+                    Ok(Some(entry.ast))
+                } else {
+                    let ast = parse_nickel(self.alloc, file_id, self.sources.files.source(file_id))
+                        .map_err(|parse_err| ImportErrorKind::ParseErrors(parse_err, *pos))?;
+                    let ast = self.alloc.alloc(ast);
+                    self.asts.insert(file_id, AstEntry::new(ast));
+                    Ok(Some(ast))
+                }
+            } else {
+                Ok(None)
+            };
+        }
+
         let (possible_parents, path, pkg_id, format) = match import {
             ast::Import::Path { path, format } => {
-                // A virtual path is treated as an opaque identifier
-                if is_virtual_path(&path)
-                {
-                    (vec![PathBuf::new()], Path::new(path), None, *format)
-                } else {
-                    // `parent` is the file that did the import. We first look in its containing
-                    // directory, followed by the directories in the import path.
-                    let parent_path = parent_id
-                        .and_then(|parent| self.sources.file_paths.get(&parent))
-                        .and_then(|path| <&OsStr>::try_from(path).ok())
-                        .map(PathBuf::from)
-                        .map(|mut path| {
-                            path.pop();
-                            path
-                        })
-                        // If the parent isn't a proper file, we look in the current directory instead.
-                        // This is useful when importing e.g. from the REPL or the CLI directly.
-                        .unwrap_or_default();
+                // `parent` is the file that did the import. We first look in its containing
+                // directory, followed by the directories in the import path.
+                let parent_path = parent_id
+                    .and_then(|parent| self.sources.file_paths.get(&parent))
+                    .and_then(|path| <&OsStr>::try_from(path).ok())
+                    .map(PathBuf::from)
+                    .map(|mut path| {
+                        path.pop();
+                        path
+                    })
+                    // If the parent isn't a proper file, we look in the current directory instead.
+                    // This is useful when importing e.g. from the REPL or the CLI directly.
+                    .unwrap_or_default();
 
-                    (
-                        std::iter::once(parent_path)
-                            .chain(self.sources.import_paths.iter().cloned())
-                            .collect(),
-                        Path::new(path),
-                        None,
-                        *format,
-                    )
-                }
+                (
+                    std::iter::once(parent_path)
+                        .chain(self.sources.import_paths.iter().cloned())
+                        .collect(),
+                    Path::new(path),
+                    None,
+                    *format,
+                )
             }
             ast::Import::Package { id } => {
                 let package_map = self

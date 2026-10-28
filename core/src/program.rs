@@ -1163,19 +1163,20 @@ impl<R, W> ProgramBuilder<R, W> {
         self
     }
 
-    /// Adds a virtual file at `path` with the in-memory `content`, as though it were
-    /// a file in the file system.
+    /// Registers `content` as a virtual file importable as `name`, which will be automatically
+    /// prefixed with [crate::cache::VIRTUAL_PATH_PREFIX] and is treated as an opaque identifier,
+    /// never as a path.
     pub fn add_virtual_file(
         mut self,
         content: impl Into<String>,
-        path: impl Into<OsString>,
+        name: impl Into<OsString>,
         format: InputFormat,
     ) -> Self {
         let mut virtual_path = OsString::new();
         // See https://github.com/tweag/nickel/issues/2362 and the documentation of
         // VIRTUAL_PATH_PREFIX
         virtual_path.push(VIRTUAL_PATH_PREFIX);
-        virtual_path.push(path.into());
+        virtual_path.push(name.into());
         self.virtual_files
             .push((virtual_path, content.into(), format));
         self
@@ -1301,23 +1302,21 @@ where
 
         let mut cache = CacheHub::new();
 
-        // Insert virtual files first
-        for (path, content, format) in virtual_files {
-            // Require all virtual files be prefixed correctly, skipping conversion to UTF8
-            if !is_virtual_path(&path)
-            {
+        for (name, content, format) in virtual_files {
+            if !crate::cache::is_virtual_path(&name) {
                 return Err(BuilderError::Io {
-                    path: Some(path.into()),
+                    path: Some(name.clone().into()),
                     error: std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("Virtual file paths must be prefixed by {VIRTUAL_PATH_PREFIX}"),
+                        format!(
+                            "a virtual file name must start with {}",
+                            crate::cache::VIRTUAL_PATH_PREFIX
+                        ),
                     ),
                 });
             }
 
-            cache
-                .sources
-                .add_string(SourcePath::Path(path.into(), format), content);
+            cache.sources.add_virtual_file(name, format, content);
         }
 
         let main_id = if inputs.len() == 1 {
@@ -1433,25 +1432,29 @@ fn register_input_as_import(
             })))
         }
         BuilderInput::Source {
-            source,
+            mut source,
             name,
             format,
         } => {
-            let mut import_path = OsString::new();
-            // See https://github.com/tweag/nickel/issues/2362 and the documentation of
-            // VIRTUAL_PATH_PREFIX
-            import_path.push(VIRTUAL_PATH_PREFIX);
-            import_path.push(&name);
+            // An in-memory input is registered as a virtual file and imported by that same
+            // name, so the registration key and the import agree verbatim.
+            let mut virtual_name = OsString::from(crate::cache::VIRTUAL_PATH_PREFIX);
+            virtual_name.push(&name);
 
-            cache
-                .sources
-                .add_source(SourcePath::Path(import_path.clone().into(), format), source)
+            let mut buffer = String::new();
+            source
+                .read_to_string(&mut buffer)
                 .map_err(|err| BuilderError::Io {
                     path: Some(name.into()),
                     error: err,
                 })?;
+
+            cache
+                .sources
+                .add_virtual_file(virtual_name.clone(), format, buffer);
+
             Ok(NickelValue::from(Term::Import(Import::Path {
-                path: import_path,
+                path: virtual_name,
                 format,
             })))
         }
