@@ -1303,19 +1303,6 @@ where
         let mut cache = CacheHub::new();
 
         for (name, content, format) in virtual_files {
-            if !crate::cache::is_virtual_path(&name) {
-                return Err(BuilderError::Io {
-                    path: Some(name.clone().into()),
-                    error: std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "a virtual file name must start with {}",
-                            crate::cache::VIRTUAL_PATH_PREFIX
-                        ),
-                    ),
-                });
-            }
-
             cache.sources.add_virtual_file(name, format, content);
         }
 
